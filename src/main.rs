@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 
 use bytes::BytesMut;
 use rand::seq::SliceRandom;
 use rlimit::Resource;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 
@@ -90,7 +90,10 @@ async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
                         let (conn_tx, conn_rx) = unbounded_channel::<BytesMut>();
                         let dest_tx = dest_tx.clone();
                         tokio::spawn(async move {
-                            let dest_conn = TcpStream::connect(ENCLAVE_DEST_ADDR).await.unwrap();
+                            let socket = TcpSocket::new_v4().unwrap();
+                            socket.set_reuseaddr(true).unwrap();
+                            socket.set_reuseport(true).unwrap();
+                            let dest_conn = socket.connect(SocketAddr::from_str(ENCLAVE_DEST_ADDR).unwrap()).await.unwrap();
                             enclave_tcp_comm_task(dest_conn, id, dest_tx, conn_rx).await;
                         });
                         conn_tx
