@@ -1,13 +1,12 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use bytes::BytesMut;
-use rand::{seq::SliceRandom, Rng};
+use rand::seq::SliceRandom;
 use rlimit::Resource;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::sleep,
 };
 
 #[cfg(not(feature = "all-tcp"))]
@@ -91,21 +90,8 @@ async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
                         let (conn_tx, conn_rx) = unbounded_channel::<BytesMut>();
                         let dest_tx = dest_tx.clone();
                         tokio::spawn(async move {
-                            let mut dest_conn = None;
-                            let mut backoff_time = None;
-                            while dest_conn.is_none() {
-                                dest_conn = TcpStream::connect(ENCLAVE_DEST_ADDR).await.ok();
-                                if dest_conn.is_some() {
-                                    break;
-                                }
-                                if backoff_time.is_none() {
-                                    backoff_time = Some(Duration::from_millis(rand::thread_rng().gen_range(0..10)));
-                                } else {
-                                    backoff_time = Some(backoff_time.unwrap() * 2);
-                                }
-                                sleep(backoff_time.as_ref().unwrap().clone()).await;
-                            }
-                            enclave_tcp_comm_task(dest_conn.unwrap(), id, dest_tx, conn_rx).await;
+                            let dest_conn = TcpStream::connect(ENCLAVE_DEST_ADDR).await.unwrap();
+                            enclave_tcp_comm_task(dest_conn, id, dest_tx, conn_rx).await;
                         });
                         conn_tx
                     });
