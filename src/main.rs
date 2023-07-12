@@ -17,7 +17,7 @@ pub type VsockListener = TcpListener;
 #[cfg(feature = "all-tcp")]
 pub type VsockStream = TcpStream;
 
-const CONN_COUNT: usize = 8000;
+const CONN_COUNT: usize = 1000;
 const BUF_SIZE: usize = 8192;
 
 const ENCLAVE_DEST_ADDR: &str = "127.0.0.1:8080";
@@ -44,11 +44,13 @@ async fn enclave_tcp_comm_task(
                     let rx_buf = result.unwrap();
                     if let Err(e) = dest_conn.write_all(&rx_buf).await {
         //                 eprintln!("could not write, quitting dest comm: {e}");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
                     }
                     if rx_buf.is_empty() {
-        //                 eprintln!("zero buf recv, quitting dest comm");
+          //               eprintln!("zero buf recv, quitting dest comm");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
                     }
@@ -56,11 +58,13 @@ async fn enclave_tcp_comm_task(
                 result = dest_conn.read_buf(&mut rx_buf) => {
                     if let Err(e) = result {
         //                 eprintln!("could not read, quitting dest comm: {e}");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
                     }
                     if rx_buf.is_empty() {
-        //                 eprintln!("tcp zero buf recv, quitting tcp comm");
+            //             eprintln!("tcp zero buf recv, quitting tcp comm");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
                     }
@@ -149,11 +153,13 @@ async fn host_tcp_comm_task(
                     let rx_buf = result.unwrap();
                     if let Err(e) = dest_conn.write_all(&rx_buf).await {
         //                 eprintln!("could not write, quitting tcp comm: {e}");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
                         return;
                     }
                     if rx_buf.is_empty() {
         //                 eprintln!("zero buf recv, quitting tcp comm");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
                         return;
                     }
@@ -161,12 +167,14 @@ async fn host_tcp_comm_task(
                 result = dest_conn.read_buf(&mut rx_buf) => {
                     if let Err(e) = result {
         //                 eprintln!("could not read, quitting tcp comm: {e}");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
                         return;
                     }
         //             eprintln!("tcp read {}", rx_buf.len());
                     if rx_buf.is_empty() {
         //                 eprintln!("tcp zero buf recv, quitting tcp comm");
+                        dest_conn.shutdown().await.ok();
                         tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
                         return;
                     }
