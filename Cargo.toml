@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytes = "1.4"
+futures = "0.3"
 rand = "0.8"
 rlimit = "0.10"
 tokio-vsock = "0.4"

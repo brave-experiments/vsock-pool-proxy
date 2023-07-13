@@ -1,12 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, time::Duration};
 
 use bytes::BytesMut;
+use futures::FutureExt;
 use rand::seq::SliceRandom;
 use rlimit::Resource;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    time::{sleep, Instant},
 };
 
 #[cfg(not(feature = "all-tcp"))]
@@ -17,10 +19,12 @@ pub type VsockListener = TcpListener;
 #[cfg(feature = "all-tcp")]
 pub type VsockStream = TcpStream;
 
-const CONN_COUNT: usize = 1000;
+const CONN_COUNT: usize = 150;
 const BUF_SIZE: usize = 8192;
+const CONN_CLEANUP_INTERVAL: u64 = 10000;
+const CONN_TTL: u64 = 10000;
 
-const ENCLAVE_DEST_ADDR: &str = "127.0.0.1:8080";
+const ENCLAVE_DEST_ADDR: &str = "127.0.0.1:8443";
 
 #[cfg(not(feature = "all-tcp"))]
 const ENCLAVE_VSOCK_CID: u32 = 4;
@@ -37,10 +41,16 @@ async fn enclave_tcp_comm_task(
     tx: UnboundedSender<(u32, BytesMut)>,
     mut rx: UnboundedReceiver<BytesMut>,
 ) {
+    let addr = dest_conn.local_addr().unwrap().to_string();
     loop {
         let mut rx_buf = BytesMut::with_capacity(BUF_SIZE);
         tokio::select! {
                 result = rx.recv() => {
+                    if result.is_none() {
+                        // eprintln!("rx shutdown, quitting dest comm {id} {addr}");
+                        dest_conn.shutdown().await.ok();
+                        return;
+                    }
                     let rx_buf = result.unwrap();
                     if let Err(e) = dest_conn.write_all(&rx_buf).await {
         //                 eprintln!("could not write, quitting dest comm: {e}");
@@ -49,7 +59,7 @@ async fn enclave_tcp_comm_task(
                         return;
                     }
                     if rx_buf.is_empty() {
-          //               eprintln!("zero buf recv, quitting dest comm");
+                        // eprintln!("zero buf recv, quitting dest comm {id} {addr}");
                         dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
@@ -63,7 +73,7 @@ async fn enclave_tcp_comm_task(
                         return;
                     }
                     if rx_buf.is_empty() {
-            //             eprintln!("tcp zero buf recv, quitting tcp comm");
+                        // eprintln!("tcp zero buf recv, quitting tcp comm {id} {addr}");
                         dest_conn.shutdown().await.ok();
                         tx.send((id, BytesMut::new())).ok();
                         return;
@@ -76,7 +86,8 @@ async fn enclave_tcp_comm_task(
 
 async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
     let (dest_tx, mut dest_rx) = unbounded_channel::<(u32, BytesMut)>();
-    let mut active_conns: HashMap<u32, UnboundedSender<BytesMut>> = HashMap::new();
+    let mut active_conns: HashMap<u32, (UnboundedSender<BytesMut>, Instant)> = HashMap::new();
+    let mut conn_cleanup_sleep = sleep(Duration::from_millis(CONN_CLEANUP_INTERVAL)).boxed();
     loop {
         let mut length_id_enc = [0u8; 8];
         tokio::select! {
@@ -88,21 +99,6 @@ async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
                     let length = u32::from_le_bytes(length_id_enc[0..4].try_into().unwrap());
                     let id = u32::from_le_bytes(length_id_enc[4..8].try_into().unwrap());
 
-        //             eprintln!("packet recv {length} {id}");
-
-                    let dest_conn = active_conns.entry(id).or_insert_with(|| {
-                        let (conn_tx, conn_rx) = unbounded_channel::<BytesMut>();
-                        let dest_tx = dest_tx.clone();
-                        tokio::spawn(async move {
-                            let socket = TcpSocket::new_v4().unwrap();
-                            socket.set_reuseaddr(true).unwrap();
-                            socket.set_reuseport(true).unwrap();
-                            let dest_conn = socket.connect(SocketAddr::from_str(ENCLAVE_DEST_ADDR).unwrap()).await.unwrap();
-                            enclave_tcp_comm_task(dest_conn, id, dest_tx, conn_rx).await;
-                        });
-                        conn_tx
-                    });
-
                     let mut rx_buf = BytesMut::with_capacity(length as usize);
                     while rx_buf.len() < length as usize {
                         if let Err(e) = vsock_conn.read_buf(&mut rx_buf).await {
@@ -111,12 +107,32 @@ async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
                         }
                     }
 
-                    dest_conn.send(rx_buf).ok();
+                     // eprintln!("packet recv {length} {id}");
+                    // if length == 0 {
+                        // active_conns.remove(&id);
+                        // continue;
+                    // }
+
+                    let dest_conn = active_conns.entry(id).or_insert_with(|| {
+                        let (conn_tx, conn_rx) = unbounded_channel::<BytesMut>();
+                        let dest_tx = dest_tx.clone();
+                        tokio::spawn(async move {
+                            // eprintln!("connect {id} for {length}");
+                            let socket = TcpSocket::new_v4().unwrap();
+                            //socket.set_reuseaddr(true).unwrap();
+                            //socket.set_reuseport(true).unwrap();
+                            let dest_conn = socket.connect(SocketAddr::from_str(ENCLAVE_DEST_ADDR).unwrap()).await.unwrap();
+                            enclave_tcp_comm_task(dest_conn, id, dest_tx, conn_rx).await;
+                        });
+                        (conn_tx, Instant::now())
+                    });
+
+                    dest_conn.0.send(rx_buf).ok();
                 },
                 result = dest_rx.recv() => {
                     let (id, buf) = result.unwrap();
                     if buf.is_empty() {
-                        active_conns.remove(&id);
+                        // active_conns.remove(&id);
                     }
                     let length = buf.len() as u32;
                     length_id_enc[0..4].copy_from_slice(&length.to_le_bytes());
@@ -129,6 +145,16 @@ async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
         //                 eprintln!("vsock buf write error, quitting enclave comm: {e}");
                         return;
                     }
+                },
+                _ = &mut conn_cleanup_sleep => {
+                    let ttl = Duration::from_millis(CONN_TTL);
+                    let before = active_conns.len();
+                    active_conns.retain(|_, conn| {
+                        !conn.0.is_closed() || conn.1.elapsed() < ttl
+                    });
+                    let after = active_conns.len();
+                    // eprintln!("just cleaned up {}", before - after);
+                    conn_cleanup_sleep = sleep(Duration::from_millis(CONN_CLEANUP_INTERVAL)).boxed();
                 }
             }
     }

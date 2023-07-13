@@ -485,6 +485,7 @@ name = "vsproxy"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
  "rand",
  "rlimit",
  "tokio",
