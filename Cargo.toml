@@ -1,15 +1,19 @@
 [package]
-name = "vsproxy"
+name = "vsock-pool-proxy"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0"
 bytes = "1.4"
+clap = { version = "4.3", features = ["derive"] }
 futures = "0.3"
 rand = "0.8"
 rlimit = "0.10"
 tokio-vsock = "0.4"
 tokio = { version = "1.29", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-all-tcp = []
+enclave-tcp = []
