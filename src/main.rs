@@ -14,7 +14,7 @@ use tracing::{error, info, metadata::LevelFilter};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    agnostic::listen_in_enclave,
+    agnostic::{connect_to_enclave, listen_in_enclave},
     enclave::EnclaveProxyTask,
     host::{HostProxyTask, HostTerminusTask},
 };
@@ -166,7 +166,7 @@ async fn run_on_host(args: &Cli) -> Result<()> {
                 let buf_size = args.max_chunk_size;
                 let enclave_listen_address = args.enclave_listen_address.clone();
                 tokio::spawn(async move {
-                    let dest_stream = TcpStream::connect(&enclave_listen_address).await.unwrap();
+                    let dest_stream = connect_to_enclave(&enclave_listen_address).await.unwrap();
                     let result = async {
                         let task = HostTerminusTask::new(tcp_stream, dest_stream, buf_size)?;
                         task.run().await
