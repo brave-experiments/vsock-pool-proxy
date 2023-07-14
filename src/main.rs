@@ -1,374 +1,214 @@
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, time::Duration};
+mod enclave;
+mod host;
 
-use bytes::BytesMut;
-use futures::FutureExt;
+use agnostic::{DEFAULT_ENCLAVE_PROXY_ADDR, DEFAULT_HOST_PROXY_ADDR};
+use anyhow::{Context, Result};
+use clap::{command, Parser};
 use rand::seq::SliceRandom;
 use rlimit::Resource;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream},
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{sleep, Instant},
+use tokio::{net::TcpListener, sync::mpsc::unbounded_channel};
+use tracing::{error, info, metadata::LevelFilter};
+use tracing_subscriber::EnvFilter;
+
+use crate::{
+    agnostic::listen_in_enclave,
+    enclave::EnclaveProxyTask,
+    host::{HostProxyTask, HostTerminusTask},
 };
 
-#[cfg(not(feature = "all-tcp"))]
-use tokio_vsock::{VsockListener, VsockStream};
+#[cfg(not(feature = "enclave-tcp"))]
+mod agnostic {
+    use anyhow::{anyhow, Result};
+    use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
-#[cfg(feature = "all-tcp")]
-pub type VsockListener = TcpListener;
-#[cfg(feature = "all-tcp")]
-pub type VsockStream = TcpStream;
+    pub type EnclaveListener = VsockListener;
+    pub type EnclaveStream = VsockStream;
 
-const CONN_COUNT: usize = 150;
-const BUF_SIZE: usize = 8192;
-const CONN_CLEANUP_INTERVAL: u64 = 10000;
-const CONN_TTL: u64 = 10000;
+    pub const DEFAULT_ENCLAVE_PROXY_ADDR: &str = "4:9443";
+    pub const DEFAULT_HOST_PROXY_ADDR: &str = "0.0.0.0:8443";
 
-const ENCLAVE_DEST_ADDR: &str = "127.0.0.1:8443";
+    pub fn parse_vsock_addr(address: &str) -> Result<VsockAddr> {
+        let mut address_split = address.split(":");
+        let cid = address_split
+            .next()
+            .ok_or(anyhow!("missing cid from vsock addr: {address}"))?
+            .parse()?;
+        let port = address_split
+            .next()
+            .ok_or(anyhow!("missing port from vsock addr: {address}"))?
+            .parse()?;
+        Ok(VsockAddr::new(cid, port))
+    }
 
-#[cfg(not(feature = "all-tcp"))]
-const ENCLAVE_VSOCK_CID: u32 = 4;
-#[cfg(not(feature = "all-tcp"))]
-const ENCLAVE_VSOCK_PORT: u32 = 8181;
-#[cfg(feature = "all-tcp")]
-const ENCLAVE_LISTEN_ADDR: &str = "0.0.0.0:8181";
+    pub async fn connect_to_enclave(address: &str) -> Result<EnclaveStream> {
+        let addr = parse_vsock_addr(address)?;
+        Ok(VsockStream::connect(addr.cid(), addr.port()).await?)
+    }
 
-const HOST_LISTEN_ADDR: &str = "0.0.0.0:8282";
-
-async fn enclave_tcp_comm_task(
-    mut dest_conn: TcpStream,
-    id: u32,
-    tx: UnboundedSender<(u32, BytesMut)>,
-    mut rx: UnboundedReceiver<BytesMut>,
-) {
-    let addr = dest_conn.local_addr().unwrap().to_string();
-    loop {
-        let mut rx_buf = BytesMut::with_capacity(BUF_SIZE);
-        tokio::select! {
-                result = rx.recv() => {
-                    if result.is_none() {
-                        // eprintln!("rx shutdown, quitting dest comm {id} {addr}");
-                        dest_conn.shutdown().await.ok();
-                        return;
-                    }
-                    let rx_buf = result.unwrap();
-                    if let Err(e) = dest_conn.write_all(&rx_buf).await {
-        //                 eprintln!("could not write, quitting dest comm: {e}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, BytesMut::new())).ok();
-                        return;
-                    }
-                    if rx_buf.is_empty() {
-                        // eprintln!("zero buf recv, quitting dest comm {id} {addr}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, BytesMut::new())).ok();
-                        return;
-                    }
-                },
-                result = dest_conn.read_buf(&mut rx_buf) => {
-                    if let Err(e) = result {
-        //                 eprintln!("could not read, quitting dest comm: {e}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, BytesMut::new())).ok();
-                        return;
-                    }
-                    if rx_buf.is_empty() {
-                        // eprintln!("tcp zero buf recv, quitting tcp comm {id} {addr}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, BytesMut::new())).ok();
-                        return;
-                    }
-                    tx.send((id, rx_buf)).ok();
-                }
-            }
+    pub async fn listen_in_enclave(address: &str) -> Result<EnclaveListener> {
+        let addr = parse_vsock_addr(address)?;
+        Ok(VsockListener::bind(addr.cid(), addr.port())?)
     }
 }
 
-async fn enclave_vsock_comm_task(mut vsock_conn: VsockStream) {
-    let (dest_tx, mut dest_rx) = unbounded_channel::<(u32, BytesMut)>();
-    let mut active_conns: HashMap<u32, (UnboundedSender<BytesMut>, Instant)> = HashMap::new();
-    let mut conn_cleanup_sleep = sleep(Duration::from_millis(CONN_CLEANUP_INTERVAL)).boxed();
-    loop {
-        let mut length_id_enc = [0u8; 8];
-        tokio::select! {
-                result = vsock_conn.read_exact(&mut length_id_enc) => {
-                    if let Err(e) = result {
-        //                 eprintln!("vsock length-id read error, quitting enclave comm: {e}");
-                        return;
-                    }
-                    let length = u32::from_le_bytes(length_id_enc[0..4].try_into().unwrap());
-                    let id = u32::from_le_bytes(length_id_enc[4..8].try_into().unwrap());
+#[cfg(feature = "enclave-tcp")]
+mod agnostic {
+    use anyhow::Result;
+    use tokio::net::{TcpListener, TcpStream};
 
-                    let mut rx_buf = BytesMut::with_capacity(length as usize);
-                    while rx_buf.len() < length as usize {
-                        if let Err(e) = vsock_conn.read_buf(&mut rx_buf).await {
-        //                     eprintln!("vsock buf read error, quitting enclave comm: {e}");
-                            return;
-                        }
-                    }
+    pub type EnclaveListener = TcpListener;
+    pub type EnclaveStream = TcpStream;
 
-                     // eprintln!("packet recv {length} {id}");
-                    // if length == 0 {
-                        // active_conns.remove(&id);
-                        // continue;
-                    // }
+    pub const DEFAULT_ENCLAVE_PROXY_ADDR: &str = "0.0.0.0:9443";
+    pub const DEFAULT_HOST_PROXY_ADDR: &str = "0.0.0.0:9543";
 
-                    let dest_conn = active_conns.entry(id).or_insert_with(|| {
-                        let (conn_tx, conn_rx) = unbounded_channel::<BytesMut>();
-                        let dest_tx = dest_tx.clone();
-                        tokio::spawn(async move {
-                            // eprintln!("connect {id} for {length}");
-                            let socket = TcpSocket::new_v4().unwrap();
-                            //socket.set_reuseaddr(true).unwrap();
-                            //socket.set_reuseport(true).unwrap();
-                            let dest_conn = socket.connect(SocketAddr::from_str(ENCLAVE_DEST_ADDR).unwrap()).await.unwrap();
-                            enclave_tcp_comm_task(dest_conn, id, dest_tx, conn_rx).await;
-                        });
-                        (conn_tx, Instant::now())
-                    });
+    pub async fn connect_to_enclave(address: &str) -> Result<EnclaveStream> {
+        Ok(TcpStream::connect(address).await?)
+    }
 
-                    dest_conn.0.send(rx_buf).ok();
-                },
-                result = dest_rx.recv() => {
-                    let (id, buf) = result.unwrap();
-                    if buf.is_empty() {
-                        // active_conns.remove(&id);
-                    }
-                    let length = buf.len() as u32;
-                    length_id_enc[0..4].copy_from_slice(&length.to_le_bytes());
-                    length_id_enc[4..8].copy_from_slice(&id.to_le_bytes());
-                    if let Err(e) = vsock_conn.write_all(&length_id_enc).await {
-        //                 eprintln!("vsock length-id write error, quitting enclave comm: {e}");
-                        return;
-                    }
-                    if let Err(e) = vsock_conn.write_all(&buf).await {
-        //                 eprintln!("vsock buf write error, quitting enclave comm: {e}");
-                        return;
-                    }
-                },
-                _ = &mut conn_cleanup_sleep => {
-                    let ttl = Duration::from_millis(CONN_TTL);
-                    let before = active_conns.len();
-                    active_conns.retain(|_, conn| {
-                        !conn.0.is_closed() || conn.1.elapsed() < ttl
-                    });
-                    let after = active_conns.len();
-                    // eprintln!("just cleaned up {}", before - after);
-                    conn_cleanup_sleep = sleep(Duration::from_millis(CONN_CLEANUP_INTERVAL)).boxed();
-                }
-            }
+    pub async fn listen_in_enclave(address: &str) -> Result<EnclaveListener> {
+        Ok(TcpListener::bind(address).await?)
     }
 }
 
-enum HostDataNotif {
-    NewConn(UnboundedSender<BytesMut>),
-    Data(BytesMut),
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Cli {
+    #[arg(short = 'H', long, default_value_t = false)]
+    run_on_host: bool,
+
+    #[arg(short, long, default_value_t = 150)]
+    pool_size: usize,
+
+    #[arg(long, default_value_t = 8192)]
+    max_chunk_size: usize,
+
+    #[arg(long, default_value_t = 10)]
+    conn_cleanup_interval_secs: u64,
+
+    #[arg(long, default_value_t = 10)]
+    dead_conn_ttl_secs: u64,
+
+    #[arg(short = 'c', long, default_value = "127.0.0.1:8443")]
+    enclave_connect_address: String,
+
+    #[arg(short = 'l', long, default_value = DEFAULT_ENCLAVE_PROXY_ADDR)]
+    enclave_listen_address: String,
+
+    #[arg(short = 'L', long, default_value = DEFAULT_HOST_PROXY_ADDR)]
+    host_listen_address: String,
+
+    #[arg(short = 'r', long, default_value_t = false)]
+    increase_nofile_rlimit: bool,
 }
 
-async fn host_tcp_comm_task(
-    mut dest_conn: TcpStream,
-    id: u32,
-    tx: UnboundedSender<(u32, HostDataNotif)>,
-) {
-    let (data_tx, mut data_rx) = unbounded_channel();
-    tx.send((id, HostDataNotif::NewConn(data_tx))).ok();
+async fn run_in_enclave(args: &Cli) -> Result<()> {
+    let mut enclave_listener = listen_in_enclave(&args.enclave_listen_address)
+        .await
+        .context("failed to start enclave listener")?;
+    info!("Listening on {}...", args.enclave_listen_address);
     loop {
-        let mut rx_buf = BytesMut::with_capacity(BUF_SIZE);
-        tokio::select! {
-                result = data_rx.recv() => {
-                    let rx_buf = result.unwrap();
-                    if let Err(e) = dest_conn.write_all(&rx_buf).await {
-        //                 eprintln!("could not write, quitting tcp comm: {e}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
-                        return;
+        match enclave_listener.accept().await {
+            Ok((stream, _)) => {
+                let conn_cleanup_interval_secs = args.conn_cleanup_interval_secs;
+                let dead_conn_ttl_secs = args.dead_conn_ttl_secs;
+                let buf_size = args.max_chunk_size;
+                let terminus_address = args.enclave_connect_address.clone();
+                tokio::spawn(async move {
+                    let task = EnclaveProxyTask::new(
+                        stream,
+                        conn_cleanup_interval_secs,
+                        dead_conn_ttl_secs,
+                        buf_size,
+                        terminus_address,
+                    );
+                    if let Err(e) = task.run().await {
+                        error!("enclave proxy task failed: {e}");
                     }
-                    if rx_buf.is_empty() {
-        //                 eprintln!("zero buf recv, quitting tcp comm");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
-                        return;
-                    }
-                },
-                result = dest_conn.read_buf(&mut rx_buf) => {
-                    if let Err(e) = result {
-        //                 eprintln!("could not read, quitting tcp comm: {e}");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
-                        return;
-                    }
-        //             eprintln!("tcp read {}", rx_buf.len());
-                    if rx_buf.is_empty() {
-        //                 eprintln!("tcp zero buf recv, quitting tcp comm");
-                        dest_conn.shutdown().await.ok();
-                        tx.send((id, HostDataNotif::Data(BytesMut::new()))).ok();
-                        return;
-                    }
-                    tx.send((id, HostDataNotif::Data(rx_buf))).ok();
-                }
+                });
             }
+            Err(e) => error!("failed to accept connection: {e}"),
+        }
     }
 }
 
-async fn host_vsock_comm_task(
-    mut vsock_conn: VsockStream,
-    mut data_rx: UnboundedReceiver<(u32, HostDataNotif)>,
-) {
-    let mut active_conns: HashMap<u32, UnboundedSender<BytesMut>> = HashMap::new();
-    loop {
-        let mut length_id_enc = [0u8; 8];
-        tokio::select! {
-                result = vsock_conn.read_exact(&mut length_id_enc) => {
-                    if let Err(e) = result {
-        //                 eprintln!("vsock length-id read error, quitting host comm: {e}");
-                        return;
-                    }
-                    let length = u32::from_le_bytes(length_id_enc[0..4].try_into().unwrap());
-                    let id = u32::from_le_bytes(length_id_enc[4..8].try_into().unwrap());
-
-                    let mut rx_buf = BytesMut::with_capacity(length as usize);
-                    while rx_buf.len() < length as usize {
-                        if let Err(e) = vsock_conn.read_buf(&mut rx_buf).await {
-        //                     eprintln!("vsock buf read error, quitting host comm: {e}");
-                            return;
-                        }
-                    }
-
-                    let rx_buf_empty = rx_buf.is_empty();
-                    if let Some(conn_tx) = active_conns.get(&id) {
-                        conn_tx.send(rx_buf).ok();
-                    }
-
-                    if rx_buf_empty {
-        //                 eprintln!("remove new conn sender {id} from enclave");
-                        active_conns.remove(&id);
-                    }
-                },
-                result = data_rx.recv() => {
-                    let (id, notif) = result.unwrap();
-                    match notif {
-                        HostDataNotif::NewConn(conn) => {
-        //                     eprintln!("recv new conn sender {id}");
-                            active_conns.insert(id, conn);
-                        },
-                        HostDataNotif::Data(buf) => {
-                            if buf.is_empty() {
-        //                         eprintln!("remove new conn sender {id} from tcp host");
-                                active_conns.remove(&id);
-                            }
-                            let length = buf.len() as u32;
-
-        //                     eprintln!("sending {length} for {id}");
-
-                            length_id_enc[0..4].copy_from_slice(&length.to_le_bytes());
-                            length_id_enc[4..8].copy_from_slice(&id.to_le_bytes());
-                            if let Err(e) = vsock_conn.write_all(&length_id_enc).await {
-        //                         eprintln!("vsock length-id write error, quitting enclave comm: {e}");
-                                return;
-                            }
-                            if let Err(e) = vsock_conn.write_all(&buf).await {
-        //                         eprintln!("vsock buf write error, quitting enclave comm: {e}");
-                                return;
-                            }
-                        },
-                    }
-                }
-            }
-    }
-}
-
-#[cfg(not(feature = "all-tcp"))]
-async fn run_in_enclave() {
-    let mut vsock_listen = VsockListener::bind(ENCLAVE_VSOCK_CID, ENCLAVE_VSOCK_PORT).unwrap();
-    // eprintln!("Listening on vsock...");
-    loop {
-        let (stream, _) = vsock_listen.accept().await.unwrap();
-        //     eprintln!("Accepted vsock connection");
+async fn run_on_host(args: &Cli) -> Result<()> {
+    let mut to_enclave_txs = Vec::new();
+    info!("Setting up {} enclave connections...", args.pool_size);
+    for _ in 0..args.pool_size {
+        let (to_enclave_tx, from_terminus_rx) = unbounded_channel();
+        to_enclave_txs.push(to_enclave_tx);
+        let task = HostProxyTask::new(&args.enclave_listen_address, from_terminus_rx).await?;
         tokio::spawn(async move {
-            enclave_vsock_comm_task(stream).await;
+            if let Err(e) = task.run().await {
+                error!("enclave proxy task failed: {e}");
+            }
         });
     }
-}
 
-#[cfg(feature = "all-tcp")]
-async fn run_in_enclave() {
-    let vsock_listen = VsockListener::bind(ENCLAVE_LISTEN_ADDR).await.unwrap();
-    // eprintln!("Listening on mock vsock...");
-    loop {
-        let (stream, _) = vsock_listen.accept().await.unwrap();
-        //     eprintln!("Accepted vsock connection");
-        tokio::spawn(async move {
-            enclave_vsock_comm_task(stream).await;
-        });
-    }
-}
-
-#[cfg(not(feature = "all-tcp"))]
-async fn run_in_host() {
-    let mut vsock_txs = Vec::new();
-    // eprintln!("Creating vsock connections");
-    for _ in 0..CONN_COUNT {
-        let vsock_conn = VsockStream::connect(ENCLAVE_VSOCK_CID, ENCLAVE_VSOCK_PORT)
-            .await
-            .unwrap();
-        let (vsock_tx, vsock_rx) = unbounded_channel();
-        vsock_txs.push(vsock_tx);
-        tokio::spawn(async move {
-            host_vsock_comm_task(vsock_conn, vsock_rx).await;
-        });
-    }
     let mut next_id = 1u32;
-    let tcp_listen = TcpListener::bind(HOST_LISTEN_ADDR).await.unwrap();
-    // eprintln!("Listening on tcp {HOST_LISTEN_ADDR}...");
+    let host_listener = TcpListener::bind(&args.host_listen_address)
+        .await
+        .context("failed to start host listener")?;
+    info!("Listening on tcp {}...", args.host_listen_address);
     loop {
         let id = next_id;
         next_id = next_id.overflowing_add(1).0;
-        let (tcp_stream, _) = tcp_listen.accept().await.unwrap();
-        let vsock_tx = vsock_txs.choose(&mut rand::thread_rng()).unwrap().clone();
-        tokio::spawn(async move {
-            host_tcp_comm_task(tcp_stream, id, vsock_tx).await;
-        });
+        match host_listener.accept().await {
+            Ok((tcp_stream, _)) => {
+                let to_enclave_tx = to_enclave_txs
+                    .choose(&mut rand::thread_rng())
+                    .expect("should be able to select random to_enclave_tx")
+                    .clone();
+                let buf_size = args.max_chunk_size;
+                tokio::spawn(async move {
+                    let result = async {
+                        let task = HostTerminusTask::new(tcp_stream, id, buf_size, to_enclave_tx)?;
+                        task.run().await
+                    };
+                    if let Err(e) = result.await {
+                        error!("tcp terminus task failed: {e}");
+                    }
+                });
+            }
+            Err(e) => error!("failed to accept connection: {e}"),
+        }
     }
 }
 
-#[cfg(feature = "all-tcp")]
-async fn run_in_host() {
-    let mut vsock_txs = Vec::new();
-    // eprintln!("Creating vsock connections");
-    for _ in 0..CONN_COUNT {
-        let vsock_conn = VsockStream::connect(ENCLAVE_LISTEN_ADDR).await.unwrap();
-        let (vsock_tx, vsock_rx) = unbounded_channel();
-        vsock_txs.push(vsock_tx);
-        tokio::spawn(async move {
-            host_vsock_comm_task(vsock_conn, vsock_rx).await;
-        });
-    }
-    let mut next_id = 1u32;
-    let tcp_listen = TcpListener::bind(HOST_LISTEN_ADDR).await.unwrap();
-    // eprintln!("Listening on tcp {HOST_LISTEN_ADDR}...");
-    loop {
-        let id = next_id;
-        next_id = next_id.overflowing_add(1).0;
-        let (tcp_stream, _) = tcp_listen.accept().await.unwrap();
-        let vsock_tx = vsock_txs.choose(&mut rand::thread_rng()).unwrap().clone();
-        tokio::spawn(async move {
-            host_tcp_comm_task(tcp_stream, id, vsock_tx).await;
-        });
-    }
+fn increase_nofile_rlimit() -> Result<()> {
+    let curr_limits = rlimit::getrlimit(Resource::NOFILE)?;
+    info!("Current fd limits = {:?}", curr_limits);
+
+    rlimit::setrlimit(Resource::NOFILE, 65535, 65535)?;
+    let curr_limits = rlimit::getrlimit(Resource::NOFILE)?;
+    info!(
+        "Attempted fd limit change! Current fd limits = {:?}",
+        curr_limits
+    );
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    // let curr_limits = rlimit::getrlimit(Resource::NOFILE).unwrap();
-    // // eprintln!("setting fd limit in randsrv curr = {:?}", curr_limits);
-    // rlimit::setrlimit(Resource::NOFILE, 65535, 65535).unwrap();
-    // let curr_limits = rlimit::getrlimit(Resource::NOFILE).unwrap();
-    // // eprintln!("set fd limit in randsrv! changed = {:?}", curr_limits);
+async fn main() -> Result<()> {
+    let args = Cli::parse();
 
-    let on_host = !std::env::var("ON_HOST").unwrap_or_default().is_empty();
-    if on_host {
-        run_in_host().await;
+    if args.increase_nofile_rlimit {
+        increase_nofile_rlimit().context("failed to increase fd limit")?;
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env()
+                .expect("should create tracing subscriber env filter"),
+        )
+        .init();
+
+    if args.run_on_host {
+        run_on_host(&args).await
     } else {
-        run_in_enclave().await;
+        run_in_enclave(&args).await
     }
 }
